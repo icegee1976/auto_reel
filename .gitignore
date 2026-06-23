@@ -1,0 +1,7 @@
+node_modules/
+dist/
+data/uploads/
+data/jobs/
+data/outputs/
+data/test-fixtures/
+*.log
