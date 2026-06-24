@@ -24,10 +24,15 @@ const app = express();
 const port = Number(process.env.PORT || 4100);
 const ffmpegPath = process.env.FFMPEG_PATH || ffmpegStatic || "ffmpeg";
 const ffprobePath = process.env.FFPROBE_PATH || ffprobeStatic.path || "ffprobe";
+const configuredFfmpegTimeoutMs = Number(process.env.FFMPEG_TIMEOUT_MS || 15 * 60 * 1000);
+const ffmpegTimeoutMs = Number.isFinite(configuredFfmpegTimeoutMs) && configuredFfmpegTimeoutMs > 0
+  ? configuredFfmpegTimeoutMs
+  : 15 * 60 * 1000;
 
 const visualExtensions = new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"]);
 const imageExtensions = new Set([".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"]);
 const audioExtensions = new Set([".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"]);
+let activeRender = false;
 
 await ensureBaseDirs();
 
@@ -103,6 +108,14 @@ app.post("/api/upload", upload.array("files"), async (req, res, next) => {
 });
 
 app.post("/api/render", async (req, res, next) => {
+  if (activeRender) {
+    res.status(409).json({ error: "已有影片正在輸出，請等目前任務完成後再試。" });
+    return;
+  }
+
+  let jobDir = null;
+  activeRender = true;
+
   try {
     const payload = req.body || {};
     const manifest = await readManifest();
@@ -117,7 +130,7 @@ app.post("/api/render", async (req, res, next) => {
     }
 
     const jobId = nanoid(12);
-    const jobDir = path.join(jobsDir, jobId);
+    jobDir = path.join(jobsDir, jobId);
     await fs.mkdir(jobDir, { recursive: true });
 
     const rendered = [];
@@ -186,6 +199,11 @@ app.post("/api/render", async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  } finally {
+    activeRender = false;
+    if (jobDir) {
+      await removePath(jobDir);
+    }
   }
 });
 
@@ -222,6 +240,10 @@ async function ensureBaseDirs() {
   if (!fsSync.existsSync(manifestPath)) {
     await fs.writeFile(manifestPath, "[]", "utf8");
   }
+}
+
+async function removePath(targetPath) {
+  await fs.rm(targetPath, { recursive: true, force: true }).catch(() => {});
 }
 
 function classifyFile(mimetype, ext) {
@@ -325,9 +347,15 @@ async function renderSegment(asset, index, settings, jobDir) {
   const duration = fixed(asset.duration);
   const filter = buildVideoFilter(asset, settings);
   const args = ["-y"];
+  const outputDurationArgs = [];
 
   if (asset.kind === "image") {
-    args.push("-loop", "1", "-t", duration, "-i", asset.path);
+    if (usesZoompan(asset)) {
+      args.push("-i", asset.path);
+    } else {
+      args.push("-loop", "1", "-i", asset.path);
+    }
+    outputDurationArgs.push("-t", duration);
   } else {
     const sourceDuration = Number(asset.sourceDuration) || 0;
     const canLoop = Number(asset.duration) > 0 && Number(asset.duration) > sourceDuration + 0.2;
@@ -339,6 +367,7 @@ async function renderSegment(asset, index, settings, jobDir) {
   args.push(
     "-vf",
     filter,
+    ...outputDurationArgs,
     "-r",
     String(settings.fps),
     "-an",
@@ -372,7 +401,7 @@ function buildVideoFilter(asset, settings) {
 }
 
 function buildImageMotionFilter(asset, width, height, fps, background) {
-  if (asset.kind !== "image" || asset.fit === "contain" || asset.motion === "still") {
+  if (asset.kind !== "image" || asset.motion === "still") {
     if (asset.fit === "contain") {
       return [
         `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
@@ -393,6 +422,10 @@ function buildImageMotionFilter(asset, width, height, fps, background) {
   const frames = Math.max(1, Math.round(asset.duration * fps));
   const motionCanvasWidth = Math.ceil(width * 1.12);
   const motionCanvasHeight = Math.ceil(height * 1.12);
+
+  if (asset.fit === "contain") {
+    return buildContainedMotionFilter(asset, width, height, fps, background, frames, motionCanvasWidth, motionCanvasHeight);
+  }
 
   if (asset.motion === "zoomIn" || asset.motion === "zoomOut") {
     const zoomExpression = asset.motion === "zoomIn"
@@ -422,6 +455,49 @@ function buildImageMotionFilter(asset, width, height, fps, background) {
 
   return [
     `scale=${motionCanvasWidth}:${motionCanvasHeight}:force_original_aspect_ratio=increase`,
+    `crop=${width}:${height}:${xByMotion[asset.motion] || "'(iw-ow)/2'"}:${yByMotion[asset.motion] || "'(ih-oh)/2'"}`,
+    `fps=${fps}`,
+    "setsar=1"
+  ];
+}
+
+function usesZoompan(asset) {
+  return asset.kind === "image" && ["zoomIn", "zoomOut"].includes(asset.motion);
+}
+
+function buildContainedMotionFilter(asset, width, height, fps, background, frames, motionCanvasWidth, motionCanvasHeight) {
+  const innerWidth = Math.ceil(width * 0.88);
+  const innerHeight = Math.ceil(height * 0.88);
+
+  if (asset.motion === "zoomIn" || asset.motion === "zoomOut") {
+    const zoomExpression = asset.motion === "zoomIn"
+      ? `'1+0.08*on/${frames}'`
+      : `'1.08-0.08*on/${frames}'`;
+
+    return [
+      `scale=${innerWidth}:${innerHeight}:force_original_aspect_ratio=decrease`,
+      `pad=${motionCanvasWidth}:${motionCanvasHeight}:(ow-iw)/2:(oh-ih)/2:color=${background}`,
+      `zoompan=z=${zoomExpression}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${frames}:s=${width}x${height}:fps=${fps}`,
+      "setsar=1"
+    ];
+  }
+
+  const xByMotion = {
+    panLeft: `'(iw-ow)*n/${frames}'`,
+    panRight: `'(iw-ow)*(1-n/${frames})'`,
+    panUp: "'(iw-ow)/2'",
+    panDown: "'(iw-ow)/2'"
+  };
+  const yByMotion = {
+    panLeft: "'(ih-oh)/2'",
+    panRight: "'(ih-oh)/2'",
+    panUp: `'(ih-oh)*n/${frames}'`,
+    panDown: `'(ih-oh)*(1-n/${frames})'`
+  };
+
+  return [
+    `scale=${innerWidth}:${innerHeight}:force_original_aspect_ratio=decrease`,
+    `pad=${motionCanvasWidth}:${motionCanvasHeight}:(ow-iw)/2:(oh-ih)/2:color=${background}`,
     `crop=${width}:${height}:${xByMotion[asset.motion] || "'(iw-ow)/2'"}:${yByMotion[asset.motion] || "'(ih-oh)/2'"}`,
     `fps=${fps}`,
     "setsar=1"
@@ -538,16 +614,27 @@ function runFfmpeg(args, label) {
       windowsHide: true
     });
     let stderr = "";
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGKILL");
+    }, ffmpegTimeoutMs);
 
     proc.stderr.on("data", (chunk) => {
       stderr += chunk.toString();
       if (stderr.length > 12000) stderr = stderr.slice(-12000);
     });
 
-    proc.on("error", reject);
+    proc.on("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
     proc.on("close", (code) => {
+      clearTimeout(timer);
       if (code === 0) {
         resolve();
+      } else if (timedOut) {
+        reject(new Error(`FFmpeg timed out during ${label} after ${Math.round(ffmpegTimeoutMs / 1000)} seconds.`));
       } else {
         reject(new Error(`FFmpeg failed during ${label}.\n${stderr}`));
       }

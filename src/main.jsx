@@ -21,6 +21,8 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
+const renderTimeoutMs = 30 * 60 * 1000;
+
 const defaultSettings = {
   aspect: "reel",
   resolution: "full",
@@ -114,10 +116,13 @@ function App() {
     setRendering(true);
     setMessage("");
     setRenderResult(null);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), renderTimeoutMs);
 
     try {
       const response = await fetch("/api/render", {
         method: "POST",
+        signal: controller.signal,
         headers: {
           "Content-Type": "application/json"
         },
@@ -140,8 +145,9 @@ function App() {
       setRenderResult(data);
       setMessage("影片已完成");
     } catch (error) {
-      setMessage(error.message || "輸出失敗");
+      setMessage(error.name === "AbortError" ? "輸出逾時，已停止等待。請降低解析度或素材數量後重試。" : error.message || "輸出失敗");
     } finally {
+      window.clearTimeout(timeout);
       setRendering(false);
     }
   }
