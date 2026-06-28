@@ -37,8 +37,8 @@ const defaultSettings = {
 
 const defaultScene = {
   duration: 4,
-  fit: "cover",
-  motion: "zoomIn",
+  fit: "contain",
+  motion: "still",
   transitionEffect: "fade",
   transition: 0.25,
   trimStart: 0
@@ -50,8 +50,8 @@ function App() {
   const [settings, setSettings] = useState(defaultSettings);
   const [batch, setBatch] = useState({
     duration: 4,
-    fit: "cover",
-    motion: "zoomIn",
+    fit: "contain",
+    motion: "still",
     transitionEffect: "fade",
     transition: 0.25
   });
